@@ -299,7 +299,20 @@ impl NusbDevice {
             match (s.recipient(), s.request) {
                 (0, req::SET_ADDRESS) => return UrbResponse::out_ok(0),
                 (0, req::SET_CONFIGURATION) => {
-                    debug!(busid = %self.busid, cfg = s.value, "SET_CONFIGURATION");
+                    let wanted = s.value as u8;
+                    let active = self
+                        .device
+                        .active_configuration()
+                        .ok()
+                        .map(|c| c.configuration_value());
+                    debug!(busid = %self.busid, wanted, ?active, "SET_CONFIGURATION");
+                    // The remote host always sets the configuration while enumerating. If it is
+                    // already active, leave the device alone (as the kernel's usbip-host does):
+                    // re-setting it fails with EBUSY while interfaces are held, and would
+                    // needlessly reset the device.
+                    if active == Some(wanted) {
+                        return UrbResponse::out_ok(0);
+                    }
                     self.drop_endpoints(None);
                     self.interfaces.lock().unwrap().clear();
                     if let Err(e) = self.device.set_configuration(s.value as u8).await {
@@ -311,6 +324,15 @@ impl NusbDevice {
                         return UrbResponse::error(errno::EIO);
                     }
                     return UrbResponse::out_ok(0);
+                }
+                (0, req::GET_DESCRIPTOR) if s.is_in() && (s.value >> 8) == 2 => {
+                    // Serve configuration descriptors with UAS alternate settings removed.
+                    let index = (s.value & 0xff) as usize;
+                    if let Some(cfg) = self.device.configurations().nth(index) {
+                        let mut d = strip_uas(cfg.as_bytes());
+                        d.truncate(s.length as usize);
+                        return UrbResponse::in_data(d);
+                    }
                 }
                 (1, req::SET_INTERFACE) => {
                     let (n, alt) = (s.index as u8, s.value as u8);
@@ -465,9 +487,117 @@ impl UsbDevice for NusbDevice {
     }
 }
 
+/// Remove USB Attached SCSI (UAS) alternate settings from a configuration descriptor.
+///
+/// UAS needs USB 3 bulk streams, which the USB/IP protocol cannot carry, so a remote
+/// host that picks UAS hangs. Mass-storage devices that support UAS also offer the
+/// classic Bulk-Only Transport as another alternate setting of the same interface;
+/// hiding the UAS one makes the remote host use `usb-storage` instead. An interface
+/// whose only alternate setting is UAS is left unchanged.
+pub fn strip_uas(config: &[u8]) -> Vec<u8> {
+    const UAS: (u8, u8) = (0x08, 0x62); // class mass storage, protocol UAS
+                                        // Split into descriptors.
+    let mut descs: Vec<&[u8]> = Vec::new();
+    let mut off = 0;
+    while off + 2 <= config.len() {
+        let len = config[off] as usize;
+        if len < 2 || off + len > config.len() {
+            break;
+        }
+        descs.push(&config[off..off + len]);
+        off += len;
+    }
+    if descs.first().is_none_or(|d| d[1] != 2 || d.len() < 9) {
+        return config.to_vec();
+    }
+    let is_intf = |d: &[u8]| d[1] == 4 && d.len() >= 9;
+    let is_uas = |d: &[u8]| is_intf(d) && (d[5], d[7]) == UAS;
+    // Interfaces that also have a non-UAS alternate setting.
+    let has_fallback: Vec<u8> = descs
+        .iter()
+        .filter(|d| is_intf(d) && !is_uas(d))
+        .map(|d| d[2])
+        .collect();
+
+    let mut out = descs[0].to_vec();
+    let mut skipping = false;
+    for d in &descs[1..] {
+        if is_intf(d) || d[1] == 11 {
+            // A new interface (or interface association) ends the previous one.
+            skipping = is_uas(d) && has_fallback.contains(&d[2]);
+        }
+        if !skipping {
+            out.extend_from_slice(d);
+        }
+    }
+    let total = out.len() as u16;
+    out[2..4].copy_from_slice(&total.to_le_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Filter;
+    use super::{strip_uas, Filter};
+
+    fn intf(num: u8, alt: u8, protocol: u8, eps: u8) -> Vec<u8> {
+        vec![9, 4, num, alt, eps, 0x08, 0x06, protocol, 0]
+    }
+    fn ep(addr: u8) -> Vec<u8> {
+        vec![7, 5, addr, 2, 0x00, 0x04, 0]
+    }
+    fn config(body: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = body.concat();
+        let total = (9 + body.len()) as u16;
+        let mut c = vec![9, 2, total as u8, (total >> 8) as u8, 1, 1, 0, 0x80, 50];
+        c.extend(body);
+        c
+    }
+
+    #[test]
+    fn strips_uas_alt_setting() {
+        // Typical UAS stick: alt 0 = Bulk-Only (0x50), alt 1 = UAS (0x62) with 4 endpoints
+        // plus SuperSpeed companion and pipe usage descriptors.
+        let ss_companion = vec![6, 0x30, 0, 0, 0, 0];
+        let pipe_usage = vec![4, 0x24, 1, 0];
+        let bot = [
+            intf(0, 0, 0x50, 2),
+            ep(0x81),
+            ss_companion.clone(),
+            ep(0x02),
+            ss_companion.clone(),
+        ];
+        let uas = [
+            intf(0, 1, 0x62, 4),
+            ep(0x81),
+            ss_companion.clone(),
+            pipe_usage.clone(),
+            ep(0x02),
+            ss_companion.clone(),
+            pipe_usage.clone(),
+            ep(0x83),
+            ss_companion.clone(),
+            pipe_usage.clone(),
+            ep(0x04),
+            ss_companion.clone(),
+            pipe_usage,
+        ];
+        let full = config(&[bot.to_vec(), uas.to_vec()].concat());
+        let stripped = strip_uas(&full);
+        assert_eq!(stripped, config(&bot));
+        assert_eq!(
+            u16::from_le_bytes([stripped[2], stripped[3]]) as usize,
+            stripped.len()
+        );
+    }
+
+    #[test]
+    fn keeps_uas_only_interface_and_non_storage_configs() {
+        let only_uas = config(&[intf(0, 0, 0x62, 1), ep(0x81)]);
+        assert_eq!(strip_uas(&only_uas), only_uas);
+        let bot_only = config(&[intf(0, 0, 0x50, 2), ep(0x81), ep(0x02)]);
+        assert_eq!(strip_uas(&bot_only), bot_only);
+        assert_eq!(strip_uas(&[1, 2, 3]), vec![1, 2, 3]);
+    }
 
     /// nusb runs blocking syscalls (open, claim, set configuration) on a thread pool,
     /// which needs its `tokio` feature. Without it, awaiting them panics. This goes

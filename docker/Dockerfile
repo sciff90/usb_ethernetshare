@@ -30,5 +30,5 @@ RUN if [ "$INSTALL_TOOLS" = 1 ]; then \
     fi
 COPY --from=build /usr/local/bin/usbshare /usr/local/bin/usbshare-server /usr/local/bin/
 COPY docker/client-test.sh docker/kernel-test.sh /usr/local/bin/
-EXPOSE 3240
+EXPOSE 3240 8080
 CMD ["usbshare-server", "--help"]

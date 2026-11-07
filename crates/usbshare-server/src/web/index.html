@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>usbshare</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='10' cy='7' r='1'/%3E%3Ccircle cx='4' cy='20' r='1'/%3E%3Cpath d='M4.7 19.3 19 5'/%3E%3Cpath d='m21 3-3 1 2 2Z'/%3E%3Cpath d='M9.26 7.68 5 12l2 5'/%3E%3Cpath d='m10 14 5 2 3.5-3.5'/%3E%3Cpath d='m18 12 1-1 1 1-1 1Z'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #f1f3f6;
+    --border: #e3e6eb;
+    --text: #15181d;
+    --muted: #5f6774;
+    --faint: #8a919c;
+    --accent: #2563eb;
+    --ok: #15803d;
+    --ok-bg: #e8f5ec;
+    --busy: #b45309;
+    --busy-bg: #fdf1e3;
+    --err: #b91c1c;
+    --err-bg: #fdecec;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .05);
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115;
+      --surface: #171a20;
+      --surface-2: #1e222a;
+      --border: #2a2f39;
+      --text: #e8eaee;
+      --muted: #a2a9b4;
+      --faint: #737b87;
+      --accent: #6b9bff;
+      --ok: #4ade80;
+      --ok-bg: #12301e;
+      --busy: #fbbf24;
+      --busy-bg: #33260e;
+      --err: #f87171;
+      --err-bg: #3a1616;
+      --shadow: none;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1115; --surface: #171a20; --surface-2: #1e222a; --border: #2a2f39;
+    --text: #e8eaee; --muted: #a2a9b4; --faint: #737b87; --accent: #6b9bff;
+    --ok: #4ade80; --ok-bg: #12301e; --busy: #fbbf24; --busy-bg: #33260e;
+    --err: #f87171; --err-bg: #3a1616; --shadow: none; color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .logo {
+    width: 36px; height: 36px; border-radius: 9px; flex: none;
+    display: grid; place-items: center;
+    background: var(--surface); border: 1px solid var(--border); color: var(--accent);
+  }
+  h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -.01em; overflow-wrap: anywhere; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
+  .sub code { font-family: var(--mono); font-size: 12.5px; }
+  .live { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); padding-top: 8px; }
+  .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  .live.stale .pulse { background: var(--err); }
+
+  .banner {
+    display: none; margin-top: 16px; padding: 10px 14px; border-radius: 8px;
+    background: var(--err-bg); color: var(--err); font-size: 13px;
+  }
+  .banner.show { display: block; }
+
+  .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 20px 0; }
+  .stat {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; box-shadow: var(--shadow);
+  }
+  .stat .label { color: var(--muted); font-size: 12.5px; }
+  .stat .value { font-size: 26px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+
+  .toolbar { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+  .seg { display: inline-flex; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 3px; }
+  .seg button {
+    font: inherit; font-size: 13px; border: 0; background: transparent; color: var(--muted);
+    padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  }
+  .seg button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow); font-weight: 550; }
+  .seg button:focus-visible, .copy:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input[type="search"] {
+    font: inherit; font-size: 13px; padding: 7px 10px; width: 240px; max-width: 100%;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text);
+  }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; font-weight: 550; font-size: 12px; color: var(--muted);
+    padding: 10px 16px; background: var(--surface-2); border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  td { padding: 14px 16px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .name { font-weight: 600; overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .tag { font-size: 11.5px; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 0 6px; }
+
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 550; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); }
+  .pill.busy { color: var(--busy); background: var(--busy-bg); }
+
+  .client-ip { font-family: var(--mono); font-size: 13.5px; font-weight: 600; }
+  .rates { display: flex; gap: 14px; font-size: 12.5px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+  .copy {
+    display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+    font-family: var(--mono); font-size: 12px; color: var(--text);
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 8px; cursor: pointer; text-align: left;
+  }
+  .copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .copy svg { flex: none; color: var(--faint); }
+  .copy.done svg { color: var(--ok); }
+  .empty { padding: 48px 16px; text-align: center; color: var(--muted); }
+  footer { margin-top: 16px; color: var(--faint); font-size: 12px; }
+
+  @media (max-width: 760px) {
+    .stats { gap: 8px; }
+    .stat { padding: 12px; }
+    .stat .value { font-size: 22px; }
+    input[type="search"] { width: 100%; }
+    .toolbar > * { flex: 1 1 auto; }
+    thead { display: none; }
+    table, tbody, tr, td { display: block; width: 100%; }
+    tr { border-bottom: 1px solid var(--border); padding: 12px 14px; }
+    tr:last-child { border-bottom: 0; }
+    td { border: 0; padding: 4px 0; }
+    td[data-label]::before {
+      content: attr(data-label); display: block; font-size: 11.5px; color: var(--faint); margin-bottom: 1px;
+    }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="7" r="1"/><circle cx="4" cy="20" r="1"/><path d="M4.7 19.3 19 5"/><path d="m21 3-3 1 2 2Z"/><path d="M9.26 7.68 5 12l2 5"/><path d="m10 14 5 2 3.5-3.5"/><path d="m18 12 1-1 1 1-1 1Z"/></svg>
+      </div>
+      <div style="min-width:0">
+        <h1 id="host">usbshare</h1>
+        <div class="sub" id="subtitle">Connecting…</div>
+      </div>
+    </div>
+    <div class="live" id="live"><span class="pulse"></span><span id="live-text">Live</span></div>
+  </header>
+
+  <div class="banner" id="banner" role="alert">Lost contact with the server. Retrying…</div>
+
+  <section class="stats" aria-label="Summary">
+    <div class="stat"><div class="label">Devices</div><div class="value" id="n-total">–</div></div>
+    <div class="stat"><div class="label">Available</div><div class="value" id="n-free">–</div></div>
+    <div class="stat"><div class="label">In use</div><div class="value" id="n-busy">–</div></div>
+  </section>
+
+  <div class="toolbar">
+    <div class="seg" role="group" aria-label="Filter">
+      <button type="button" data-filter="all" aria-pressed="true">All</button>
+      <button type="button" data-filter="busy" aria-pressed="false">In use</button>
+      <button type="button" data-filter="free" aria-pressed="false">Available</button>
+    </div>
+    <input type="search" id="q" placeholder="Search name, ID or IP" aria-label="Search devices">
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Device</th><th>Status</th><th>Client</th><th>Activity</th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>No devices.</div>
+  </div>
+
+  <footer id="footer"></footer>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let filter = "all";
+  let query = "";
+  let last = null;            // last status payload
+  const prev = new Map();     // busid -> {t, up, down} for rate calculation
+  const rates = new Map();    // busid -> {up, down} bytes/s
+  let failures = 0;
+  let timer = 0;
+
+  try {
+    filter = localStorage.getItem("usbshare.filter") || "all";
+  } catch (_) {}
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+
+  function bytes(n) {
+    if (n < 1024) return n + " B";
+    const u = ["KiB", "MiB", "GiB", "TiB"];
+    let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return n.toFixed(n < 10 ? 1 : 0) + " " + u[i];
+  }
+  function rate(n) { return n < 1 ? "0 B/s" : bytes(Math.round(n)) + "/s"; }
+
+  function duration(s) {
+    s = Math.max(0, Math.floor(s));
+    const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    if (d) return d + "d " + h + "h";
+    if (h) return h + "h " + m + "m";
+    if (m) return m + "m " + (s % 60) + "s";
+    return s + "s";
+  }
+
+  function ago(s) {
+    s = Math.max(0, s);
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s / 60) + " min ago";
+    if (s < 86400) return Math.floor(s / 3600) + " h ago";
+    return Math.floor(s / 86400) + " d ago";
+  }
+
+  const copyIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  const checkIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+
+  function copyButton(text) {
+    const b = el("button", "copy");
+    b.type = "button";
+    b.title = "Copy command";
+    b.innerHTML = copyIcon;
+    b.appendChild(el("span", null, text));
+    b.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        const r = document.createRange();
+        r.selectNodeContents(b.querySelector("span"));
+        const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+        return;
+      }
+      b.classList.add("done");
+      b.firstElementChild.outerHTML = checkIcon;
+      setTimeout(() => { b.classList.remove("done"); b.firstElementChild.outerHTML = copyIcon; }, 1500);
+    });
+    return b;
+  }
+
+  function serverTarget(info) {
+    const port = (info.usbip_listen.match(/:(\d+)$/) || [])[1];
+    const host = location.hostname.includes(":") ? "[" + location.hostname + "]" : location.hostname;
+    return port && port !== "3240" ? host + ":" + port : host;
+  }
+
+  function matches(d) {
+    if (filter === "busy" && !d.in_use) return false;
+    if (filter === "free" && d.in_use) return false;
+    if (!query) return true;
+    const hay = [d.busid, d.vid + ":" + d.pid, d.product, d.manufacturer, d.backend,
+      d.client && d.client.ip, d.last_client && d.last_client.ip, ...d.interfaces]
+      .filter(Boolean).join(" ").toLowerCase();
+    return hay.includes(query);
+  }
+
+  function render() {
+    if (!last) return;
+    const { server, devices } = last;
+    const busy = devices.filter((d) => d.in_use).length;
+    $("n-total").textContent = devices.length;
+    $("n-busy").textContent = busy;
+    $("n-free").textContent = devices.length - busy;
+    $("host").textContent = server.hostname;
+    $("subtitle").innerHTML = "";
+    $("subtitle").append("USB/IP on ", el("code", null, server.usbip_listen), " · up " + duration(server.uptime_secs));
+    $("footer").textContent = "usbshare-server " + server.version;
+    document.title = (busy ? "(" + busy + ") " : "") + server.hostname + " · usbshare";
+
+    const target = serverTarget(server);
+    const rows = $("rows");
+    rows.replaceChildren();
+    const shown = devices.filter(matches);
+    for (const d of shown) {
+      const tr = el("tr");
+
+      const dev = el("td"); dev.dataset.label = "Device";
+      dev.appendChild(el("div", "name", d.product || "Unknown device"));
+      const meta = el("div", "meta");
+      meta.append(el("span", "mono", d.vid + ":" + d.pid), " · bus " , el("span", "mono", d.busid),
+        " · " + d.speed + (d.manufacturer ? " · " + d.manufacturer : ""));
+      dev.appendChild(meta);
+      const tags = el("div", "tags");
+      for (const c of d.interfaces) tags.appendChild(el("span", "tag", c));
+      if (d.backend === "mock") tags.appendChild(el("span", "tag", "simulated"));
+      dev.appendChild(tags);
+      tr.appendChild(dev);
+
+      const st = el("td"); st.dataset.label = "Status";
+      st.appendChild(el("span", "pill " + (d.in_use ? "busy" : "ok"), d.in_use ? "In use" : "Available"));
+      tr.appendChild(st);
+
+      const cl = el("td"); cl.dataset.label = "Client";
+      if (d.client) {
+        cl.appendChild(el("div", "client-ip", d.client.ip));
+        cl.appendChild(el("div", "meta", "port " + d.client.port + " · connected " + duration(server.now_unix - d.client.since_unix)));
+      } else {
+        cl.appendChild(copyButton("usbshare attach " + target + " " + d.busid));
+        if (d.last_client) {
+          cl.appendChild(el("div", "meta",
+            "Last used by " + d.last_client.ip + " · " + ago(server.now_unix - d.last_client.ended_unix)));
+        }
+      }
+      tr.appendChild(cl);
+
+      const act = el("td"); act.dataset.label = "Activity";
+      if (d.client) {
+        const r = rates.get(d.busid) || { up: 0, down: 0 };
+        act.appendChild(el("div", null, bytes(d.client.bytes_to_client + d.client.bytes_from_client) + " · " +
+          d.client.transfers.toLocaleString() + " transfers"));
+        const rr = el("div", "rates");
+        rr.append(el("span", null, "↓ " + rate(r.down) + " to client"), el("span", null, "↑ " + rate(r.up) + " from client"));
+        act.appendChild(rr);
+      } else {
+        act.appendChild(el("span", "meta", "Idle"));
+      }
+      tr.appendChild(act);
+      rows.appendChild(tr);
+    }
+    const empty = $("empty");
+    empty.hidden = shown.length > 0;
+    empty.textContent = devices.length === 0
+      ? "No devices are shared. Plug in a USB device or start the server with --mock."
+      : "No devices match this filter.";
+  }
+
+  function updateRates(status) {
+    const now = performance.now();
+    const seen = new Set();
+    for (const d of status.devices) {
+      if (!d.client) continue;
+      const key = d.busid + "@" + d.client.ip + ":" + d.client.port;
+      seen.add(key);
+      const p = prev.get(key);
+      const cur = { t: now, up: d.client.bytes_from_client, down: d.client.bytes_to_client };
+      if (p) {
+        const dt = (now - p.t) / 1000;
+        if (dt > 0) rates.set(d.busid, { up: (cur.up - p.up) / dt, down: (cur.down - p.down) / dt });
+      } else {
+        rates.set(d.busid, { up: 0, down: 0 });
+      }
+      prev.set(key, cur);
+    }
+    for (const k of prev.keys()) if (!seen.has(k)) prev.delete(k);
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch("api/status", { cache: "no-store" });
+      if (!res.ok) throw new Error(res.status);
+      const status = await res.json();
+      updateRates(status);
+      last = status;
+      failures = 0;
+      $("banner").classList.remove("show");
+      $("live").classList.remove("stale");
+      $("live-text").textContent = "Live";
+      render();
+    } catch (_) {
+      failures++;
+      if (failures >= 2) {
+        $("banner").classList.add("show");
+        $("live").classList.add("stale");
+        $("live-text").textContent = "Offline";
+      }
+    } finally {
+      clearTimeout(timer);
+      timer = setTimeout(poll, document.hidden ? 10000 : 2000);
+    }
+  }
+
+  for (const b of document.querySelectorAll(".seg button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.filter === filter));
+    b.addEventListener("click", () => {
+      filter = b.dataset.filter;
+      try { localStorage.setItem("usbshare.filter", filter); } catch (_) {}
+      for (const o of document.querySelectorAll(".seg button")) o.setAttribute("aria-pressed", String(o === b));
+      render();
+    });
+  }
+  $("q").addEventListener("input", (e) => { query = e.target.value.trim().toLowerCase(); render(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) { clearTimeout(timer); poll(); } });
+  poll();
+})();
+</script>
+</body>
+</html>

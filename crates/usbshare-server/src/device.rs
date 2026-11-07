@@ -151,13 +151,21 @@ pub trait UsbDevice: Send + Sync {
     async fn release(&self) {}
 }
 
+/// A shareable device as reported by a backend.
+#[derive(Debug, Clone)]
+pub struct DeviceEntry {
+    pub exported: ExportedDevice,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+}
+
 /// A source of shareable devices.
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Short name used in logs and listings ("mock", "usbfs").
     fn name(&self) -> &'static str;
     /// Currently available devices.
-    async fn list(&self) -> anyhow::Result<Vec<ExportedDevice>>;
+    async fn list(&self) -> anyhow::Result<Vec<DeviceEntry>>;
     /// Open and claim the device with the given bus id.
     async fn open(&self, busid: &str) -> anyhow::Result<Arc<dyn UsbDevice>>;
 }

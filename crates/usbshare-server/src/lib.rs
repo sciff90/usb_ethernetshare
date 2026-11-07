@@ -5,5 +5,6 @@ pub mod mock;
 pub mod server;
 #[cfg(target_os = "linux")]
 pub mod usbfs;
+pub mod web;
 
 pub use server::Server;

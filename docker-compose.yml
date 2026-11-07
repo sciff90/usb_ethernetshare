@@ -11,6 +11,8 @@
 #
 #   docker compose --profile hardware up --build server-usb
 #       Share the host's physical USB devices (see README for gadget-based dummies).
+#
+#   Dashboards: http://localhost:8080 (simulated server), http://localhost:8081 (server-usb)
 
 services:
   server:
@@ -18,9 +20,10 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     image: usbshare:dev
-    command: ["usbshare-server", "--no-usb", "--mock", "loopback,hid,storage:64"]
+    command: ["usbshare-server", "--no-usb", "--mock", "loopback,hid,storage:64", "--web"]
     environment:
       RUST_LOG: info
+    ports: ["8080:8080"]   # web dashboard: http://localhost:8080
     networks: [usbnet]
 
   client:
@@ -47,10 +50,10 @@ services:
     volumes:
       - /dev/bus/usb:/dev/bus/usb
       - /run/udev:/run/udev:ro
-    command: ["usbshare-server"]
+    command: ["usbshare-server", "--web"]
     environment:
       RUST_LOG: info
-    ports: ["3240:3240"]
+    ports: ["3240:3240", "8081:8080"]
     networks: [usbnet]
 
 networks:

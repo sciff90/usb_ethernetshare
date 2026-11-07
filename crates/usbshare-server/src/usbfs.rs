@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use usbip_proto::{errno, DeviceDescriptor, ExportedDevice, InterfaceDescriptor, Speed};
 
-use crate::device::{req, Backend, Setup, UrbRequest, UrbResponse, UsbDevice};
+use crate::device::{req, Backend, DeviceEntry, Setup, UrbRequest, UrbResponse, UsbDevice};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -149,8 +149,17 @@ impl Backend for UsbfsBackend {
         "usbfs"
     }
 
-    async fn list(&self) -> anyhow::Result<Vec<ExportedDevice>> {
-        Ok(self.shareable().await?.iter().map(export).collect())
+    async fn list(&self) -> anyhow::Result<Vec<DeviceEntry>> {
+        Ok(self
+            .shareable()
+            .await?
+            .iter()
+            .map(|d| DeviceEntry {
+                exported: export(d),
+                manufacturer: d.manufacturer_string().map(str::to_string),
+                product: d.product_string().map(str::to_string),
+            })
+            .collect())
     }
 
     async fn open(&self, busid: &str) -> anyhow::Result<Arc<dyn UsbDevice>> {

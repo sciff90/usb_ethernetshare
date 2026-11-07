@@ -27,6 +27,10 @@ struct Cli {
     )]
     mock: Vec<MockKind>,
 
+    /// Serve the web dashboard. `--web` alone listens on 0.0.0.0:8080.
+    #[arg(long, value_name = "ADDR", env = "USBSHARE_WEB", num_args = 0..=1, default_missing_value = "0.0.0.0:8080")]
+    web: Option<SocketAddr>,
+
     /// Do not share physical USB devices (only mock devices).
     #[arg(long)]
     no_usb: bool,
@@ -105,8 +109,32 @@ async fn main() -> anyhow::Result<()> {
             b.name()
         );
     }
+    let usbip_addr = listener.local_addr()?;
+    let web = match cli.web {
+        Some(addr) => {
+            let l = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding web dashboard {addr}"))?;
+            Some(tokio::spawn(usbshare_server::web::serve(
+                server.clone(),
+                l,
+                usbip_addr,
+            )))
+        }
+        None => None,
+    };
+    let web_failed = async {
+        match web {
+            Some(h) => match h.await {
+                Ok(r) => r,
+                Err(e) => Err(e.into()),
+            },
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         r = server.serve(listener) => r,
+        r = web_failed => r,
         _ = tokio::signal::ctrl_c() => { info!("shutting down"); Ok(()) }
     }
 }

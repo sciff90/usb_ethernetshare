@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use usbip_proto::{DeviceDescriptor, ExportedDevice, InterfaceDescriptor, Speed};
 
-use crate::device::{req, Backend, Setup, UrbRequest, UrbResponse, UsbDevice};
+use crate::device::{req, Backend, DeviceEntry, Setup, UrbRequest, UrbResponse, UsbDevice};
 
 pub use hid::HidDevice;
 pub use loopback::LoopbackDevice;
@@ -319,12 +319,16 @@ impl Backend for MockBackend {
         "mock"
     }
 
-    async fn list(&self) -> anyhow::Result<Vec<ExportedDevice>> {
+    async fn list(&self) -> anyhow::Result<Vec<DeviceEntry>> {
         Ok(self
             .devices
             .iter()
             .enumerate()
-            .map(|(i, (busid, d))| d.spec().exported(busid, i as u32 + 1))
+            .map(|(i, (busid, d))| DeviceEntry {
+                exported: d.spec().exported(busid, i as u32 + 1),
+                manufacturer: Some(d.spec().manufacturer.clone()),
+                product: Some(d.spec().product.clone()),
+            })
             .collect())
     }
 

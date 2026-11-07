@@ -20,3 +20,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 usbshare-server.workspace = true
+serde_json.workspace = true

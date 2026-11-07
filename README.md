@@ -38,6 +38,8 @@ sudo usbshare-server
 sudo usbshare-server --allow 046d:c52b --allow 1-1.2     # only these devices
 usbshare-server --no-usb --mock loopback,hid,storage:64   # simulated devices only, no root needed
 usbshare-server list                                      # show what would be shared
+usbshare-server --web                                     # + web dashboard on http://<server>:8080
+usbshare-server --web 127.0.0.1:9000                      # dashboard on a specific address
 
 # Client
 usbshare list myserver                 # devices on the server
@@ -50,6 +52,17 @@ sudo usbshare detach all
 usbshare info myserver all             # dump descriptors
 usbshare test myserver                 # functional tests (see below)
 ```
+
+## Web dashboard
+
+Start the server with `--web` (or set `USBSHARE_WEB=0.0.0.0:8080`) and open `http://<server>:8080`. The page updates every 2 seconds and shows:
+
+- every shared device: name, VID:PID, bus id, speed and interface classes;
+- whether each device is **available** or **in use**;
+- for devices in use: the client's **IP address** and port, how long it has been connected, total data and transfers, and live throughput in each direction;
+- for available devices: a copyable `usbshare attach` command, and which IP last used the device and when.
+
+The same data is available as JSON from `GET /api/status`, for scripts and monitoring. The dashboard is read-only. It has no login yet, so bind it to `127.0.0.1` or a trusted network if client IPs are sensitive.
 
 ## Simulated devices
 
@@ -74,6 +87,8 @@ On real mass-storage devices it runs read-only checks only.
 ```bash
 # 1. User-space test: works anywhere, with no USB hardware, kernel modules or privileges
 docker compose up --build --abort-on-container-exit --exit-code-from client client
+#    For the dashboard, keep the server running and open http://localhost:8080:
+docker compose up --build server
 
 # 2. Kernel test: the client container attaches the simulated devices through the host's
 #    vhci-hcd. They then show up in lsusb, as /dev/sdX (written, verified, ext4 mounted)

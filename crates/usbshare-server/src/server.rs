@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::Context;
 use tokio::io::AsyncWriteExt;
@@ -15,12 +17,47 @@ use usbip_proto::{
     OpRequest, RetSubmit, RetUnlink, UrbMessage,
 };
 
-use crate::device::{Backend, UrbRequest, UsbDevice};
+use crate::device::{Backend, DeviceEntry, UrbRequest, UsbDevice};
+
+/// Live information about a client using a device.
+#[derive(Debug)]
+pub struct Usage {
+    pub peer: SocketAddr,
+    pub since: SystemTime,
+    /// Bytes sent from the device to the client (IN data).
+    pub bytes_to_client: AtomicU64,
+    /// Bytes sent from the client to the device (OUT data).
+    pub bytes_from_client: AtomicU64,
+    /// Completed transfers.
+    pub transfers: AtomicU64,
+}
+
+impl Usage {
+    fn new(peer: SocketAddr) -> Self {
+        Usage {
+            peer,
+            since: SystemTime::now(),
+            bytes_to_client: AtomicU64::new(0),
+            bytes_from_client: AtomicU64::new(0),
+            transfers: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The most recent finished session of a device.
+#[derive(Debug, Clone, Copy)]
+pub struct LastUse {
+    pub peer: SocketAddr,
+    pub since: SystemTime,
+    pub ended: SystemTime,
+}
 
 /// The set of backends plus bookkeeping of which devices are in use.
 pub struct Server {
     backends: Vec<Arc<dyn Backend>>,
-    in_use: Mutex<HashMap<String, SocketAddr>>,
+    in_use: Mutex<HashMap<String, Arc<Usage>>>,
+    last_use: Mutex<HashMap<String, LastUse>>,
+    started: SystemTime,
 }
 
 impl Server {
@@ -28,21 +65,38 @@ impl Server {
         Arc::new(Server {
             backends,
             in_use: Mutex::new(HashMap::new()),
+            last_use: Mutex::new(HashMap::new()),
+            started: SystemTime::now(),
         })
     }
 
-    /// All devices from all backends, with the backend that owns each one.
-    pub async fn devices(&self) -> Vec<(Arc<dyn Backend>, ExportedDevice)> {
+    pub fn started(&self) -> SystemTime {
+        self.started
+    }
+
+    /// Current usage of `busid`, if a client has it attached.
+    pub fn usage(&self, busid: &str) -> Option<Arc<Usage>> {
+        self.in_use.lock().unwrap().get(busid).cloned()
+    }
+
+    /// The last finished session of `busid`, if any.
+    pub fn last_use(&self, busid: &str) -> Option<LastUse> {
+        self.last_use.lock().unwrap().get(busid).copied()
+    }
+
+    /// All devices from all backends, with names and the backend that owns each one.
+    pub async fn device_entries(&self) -> Vec<(Arc<dyn Backend>, DeviceEntry)> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for b in &self.backends {
             match b.list().await {
                 Ok(devs) => {
                     for d in devs {
-                        if seen.insert(d.device.busid.clone()) {
+                        let busid = &d.exported.device.busid;
+                        if seen.insert(busid.clone()) {
                             out.push((b.clone(), d));
                         } else {
-                            warn!(busid = %d.device.busid, "duplicate bus id, ignoring");
+                            warn!(%busid, "duplicate bus id, ignoring");
                         }
                     }
                 }
@@ -52,9 +106,18 @@ impl Server {
         out
     }
 
+    /// All devices from all backends, with the backend that owns each one.
+    pub async fn devices(&self) -> Vec<(Arc<dyn Backend>, ExportedDevice)> {
+        self.device_entries()
+            .await
+            .into_iter()
+            .map(|(b, e)| (b, e.exported))
+            .collect()
+    }
+
     /// Which client (if any) currently uses `busid`.
     pub fn user_of(&self, busid: &str) -> Option<SocketAddr> {
-        self.in_use.lock().unwrap().get(busid).copied()
+        self.in_use.lock().unwrap().get(busid).map(|u| u.peer)
     }
 
     /// Accept connections forever.
@@ -109,10 +172,10 @@ impl Server {
         // Claim exclusively.
         let busy = {
             let mut in_use = self.in_use.lock().unwrap();
-            match in_use.get(&busid).copied() {
-                Some(other) => Some(other),
+            match in_use.get(&busid) {
+                Some(other) => Some(other.peer),
                 None => {
-                    in_use.insert(busid.clone(), peer);
+                    in_use.insert(busid.clone(), Arc::new(Usage::new(peer)));
                     None
                 }
             }
@@ -146,7 +209,8 @@ impl Server {
         info!(%peer, %busid, vid = format!("{:04x}", exported.device.id_vendor),
               pid = format!("{:04x}", exported.device.id_product), "device attached");
 
-        let result = run_urb_session(stream, device.clone()).await;
+        let usage = self.usage(&busid).expect("claimed above");
+        let result = run_urb_session(stream, device.clone(), usage).await;
         device.release().await;
         info!(%peer, %busid, "device detached");
         result
@@ -160,7 +224,18 @@ struct ClaimGuard<'a> {
 
 impl Drop for ClaimGuard<'_> {
     fn drop(&mut self) {
-        self.server.in_use.lock().unwrap().remove(&self.busid);
+        if let Some(u) = self.server.in_use.lock().unwrap().remove(&self.busid) {
+            let last = LastUse {
+                peer: u.peer,
+                since: u.since,
+                ended: SystemTime::now(),
+            };
+            self.server
+                .last_use
+                .lock()
+                .unwrap()
+                .insert(self.busid.clone(), last);
+        }
     }
 }
 
@@ -178,15 +253,21 @@ struct Job {
 struct Session {
     pending: Mutex<HashMap<u32, CancellationToken>>,
     tx: mpsc::UnboundedSender<Vec<u8>>,
+    usage: Arc<Usage>,
 }
 
 /// Process URBs for an imported device until the connection closes.
-pub async fn run_urb_session(stream: TcpStream, device: Arc<dyn UsbDevice>) -> anyhow::Result<()> {
+pub async fn run_urb_session(
+    stream: TcpStream,
+    device: Arc<dyn UsbDevice>,
+    usage: Arc<Usage>,
+) -> anyhow::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let session = Arc::new(Session {
         pending: Mutex::new(HashMap::new()),
         tx,
+        usage,
     });
 
     let writer = tokio::spawn(async move {
@@ -293,9 +374,18 @@ fn spawn_endpoint_worker(device: Arc<dyn UsbDevice>, session: Arc<Session>) -> m
             if cmd.direction == Direction::In {
                 data.truncate(cmd.transfer_buffer_length as usize);
                 actual = data.len() as u32;
+                session
+                    .usage
+                    .bytes_to_client
+                    .fetch_add(actual as u64, Ordering::Relaxed);
             } else {
                 data.clear();
+                session
+                    .usage
+                    .bytes_from_client
+                    .fetch_add(actual as u64, Ordering::Relaxed);
             }
+            session.usage.transfers.fetch_add(1, Ordering::Relaxed);
             let ret = RetSubmit {
                 seqnum: cmd.seqnum,
                 status: resp.status,

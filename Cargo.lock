@@ -880,6 +880,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "libc",
  "nusb",
  "serde",
  "serde_json",

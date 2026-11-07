@@ -224,7 +224,8 @@ impl MockDevice {
 #[async_trait]
 impl UsbDevice for MockDevice {
     async fn submit(&self, req: UrbRequest, cancel: &CancellationToken) -> UrbResponse {
-        if req.iso_packets > 0 {
+        if req.is_iso() {
+            // TODO(iso): simulated isochronous endpoints (loopback interface 1, alt 1).
             return UrbResponse::error(usbip_proto::errno::EXDEV);
         }
         if !req.is_control() {

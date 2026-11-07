@@ -20,7 +20,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use usbip_proto::{errno, DeviceDescriptor, ExportedDevice, InterfaceDescriptor, Speed};
 
-use crate::device::{req, Backend, DeviceEntry, Setup, UrbRequest, UrbResponse, UsbDevice};
+use crate::device::{req, Backend, DeviceEntry, Setup, UrbFuture, UrbRequest, UrbResponse, UsbDevice};
+use crate::usbfs_raw::{
+    compact_iso_in, pack_iso_out, RawTransfer, RawUsbfs, URB_TYPE_BULK, URB_TYPE_INTERRUPT, URB_TYPE_ISO,
+};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -174,9 +177,13 @@ impl Backend for UsbfsBackend {
         debug!(%busid, "usbfs device opened, claiming interfaces");
         let dev = NusbDevice {
             busid: busid.to_string(),
+            busnum: info.busnum(),
+            devnum: info.device_address(),
             device,
             interfaces: Mutex::new(HashMap::new()),
             endpoints: Mutex::new(HashMap::new()),
+            raw: Mutex::new(None),
+            raw_ifaces: Mutex::new(HashMap::new()),
         };
         dev.claim_all().await?;
         // Undo the "stop/eject" the server's own storage stack may have sent the disk
@@ -228,9 +235,15 @@ macro_rules! run_transfer {
 
 struct NusbDevice {
     busid: String,
+    busnum: u8,
+    devnum: u8,
     device: nusb::Device,
     interfaces: Mutex<HashMap<u8, Interface>>,
     endpoints: Mutex<HashMap<u8, Arc<tokio::sync::Mutex<Ep>>>>,
+    /// Second usbfs descriptor for interfaces with isochronous endpoints (see `usbfs_raw`).
+    raw: Mutex<Option<Arc<RawUsbfs>>>,
+    /// Interfaces owned by `raw`, with their current alternate setting.
+    raw_ifaces: Mutex<HashMap<u8, u8>>,
 }
 
 fn errno_of(e: TransferError) -> i32 {
@@ -245,12 +258,86 @@ fn errno_of(e: TransferError) -> i32 {
 }
 
 impl NusbDevice {
+    /// Interfaces of the active configuration with an isochronous endpoint in any
+    /// alternate setting (audio and video streaming interfaces).
+    fn iso_interfaces(&self) -> Vec<u8> {
+        let Ok(cfg) = self.device.active_configuration() else {
+            return Vec::new();
+        };
+        let mut v: Vec<u8> = cfg
+            .interface_alt_settings()
+            .filter(|a| {
+                a.endpoints()
+                    .any(|e| e.transfer_type() == TransferType::Isochronous)
+            })
+            .map(|a| a.interface_number())
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn raw(&self) -> Option<Arc<RawUsbfs>> {
+        self.raw.lock().unwrap().clone()
+    }
+
+    /// The usbfs URB type of `addr` if it belongs to a raw-owned interface
+    /// (current alternate setting).
+    fn raw_endpoint(&self, addr: u8) -> Option<u8> {
+        let cfg = self.device.active_configuration().ok()?;
+        let ifaces = self.raw_ifaces.lock().unwrap();
+        cfg.interface_alt_settings()
+            .filter(|a| ifaces.get(&a.interface_number()) == Some(&a.alternate_setting()))
+            .flat_map(|a| a.endpoints().collect::<Vec<_>>())
+            .find(|e| e.address() == addr)
+            .map(|e| match e.transfer_type() {
+                TransferType::Isochronous => URB_TYPE_ISO,
+                TransferType::Interrupt => URB_TYPE_INTERRUPT,
+                _ => URB_TYPE_BULK,
+            })
+    }
+
+    /// Whether `addr` is an endpoint of a raw-owned interface in any alternate setting.
+    fn raw_owns_endpoint(&self, addr: u8) -> bool {
+        let Ok(cfg) = self.device.active_configuration() else {
+            return false;
+        };
+        let ifaces = self.raw_ifaces.lock().unwrap();
+        cfg.interface_alt_settings()
+            .filter(|a| ifaces.contains_key(&a.interface_number()))
+            .any(|a| a.endpoints().any(|e| e.address() == addr))
+    }
+
+    fn release_raw(&self) {
+        let ifaces: Vec<u8> = self.raw_ifaces.lock().unwrap().drain().map(|(n, _)| n).collect();
+        if let Some(raw) = self.raw.lock().unwrap().take() {
+            for n in ifaces {
+                raw.release(n);
+            }
+            raw.shutdown();
+        }
+    }
+
     async fn claim_all(&self) -> anyhow::Result<()> {
         let numbers: Vec<u8> = match self.device.active_configuration() {
             Ok(c) => c.interfaces().map(|i| i.interface_number()).collect(),
             Err(_) => Vec::new(), // unconfigured
         };
+        let iso = self.iso_interfaces();
+        if !iso.is_empty() && self.raw().is_none() {
+            let raw = RawUsbfs::open(self.busnum, self.devnum)
+                .context("opening usbfs for isochronous interfaces")?;
+            *self.raw.lock().unwrap() = Some(raw);
+        }
         for n in numbers {
+            if iso.contains(&n) {
+                debug!(busid = %self.busid, interface = n, "claiming isochronous interface (raw usbfs)");
+                let raw = self.raw().expect("opened above");
+                raw.claim(n).with_context(|| format!("claiming interface {n}"))?;
+                // Detaching the kernel driver resets the interface to alternate setting 0.
+                self.raw_ifaces.lock().unwrap().insert(n, 0);
+                continue;
+            }
             debug!(busid = %self.busid, interface = n, "detaching kernel driver and claiming interface");
             let intf = self
                 .device
@@ -302,8 +389,139 @@ impl NusbDevice {
         Err(-errno::EPIPE)
     }
 
+    async fn raw_control(
+        &self,
+        raw: &Arc<RawUsbfs>,
+        s: Setup,
+        req: &UrbRequest,
+        cancel: &CancellationToken,
+    ) -> UrbResponse {
+        let to_resp = |r: Result<(), i32>| match r {
+            Ok(()) => UrbResponse::out_ok(0),
+            Err(st) => UrbResponse {
+                status: st,
+                ..Default::default()
+            },
+        };
+        if s.kind() == 0 && s.recipient() == 1 && s.request == req::SET_INTERFACE {
+            let (n, alt) = (s.index as u8, s.value as u8);
+            debug!(busid = %self.busid, n, alt, "SET_INTERFACE (raw)");
+            let r = raw.set_interface(n, alt).await;
+            if r.is_ok() {
+                self.raw_ifaces.lock().unwrap().insert(n, alt);
+            } else {
+                warn!(busid = %self.busid, n, alt, "set interface failed: {r:?}");
+            }
+            return to_resp(r);
+        }
+        if s.kind() == 0 && s.recipient() == 2 && s.request == req::CLEAR_FEATURE && s.value == 0 {
+            return to_resp(raw.clear_halt(s.index as u8).await);
+        }
+        let fut = raw.control(req.setup, req.data.clone());
+        tokio::select! {
+            r = fut => match r {
+                Ok(data) if s.is_in() => UrbResponse::in_data(data),
+                Ok(_) => UrbResponse::out_ok(req.data.len()),
+                Err(st) => UrbResponse { status: st, ..Default::default() },
+            },
+            _ = cancel.cancelled() => UrbResponse::cancelled(),
+        }
+    }
+
+    /// Start a transfer on a raw-owned endpoint; it is queued before this returns.
+    fn raw_start(
+        &self,
+        raw: &Arc<RawUsbfs>,
+        kind: u8,
+        req: UrbRequest,
+        cancel: CancellationToken,
+    ) -> UrbFuture {
+        let is_in = req.is_in();
+        let packets = req.iso.clone();
+        let buf = match (kind == URB_TYPE_ISO, is_in) {
+            (true, true) => vec![0u8; packets.iter().map(|p| p.length as usize).sum()],
+            (true, false) => pack_iso_out(&req.data, &packets),
+            (false, true) => vec![0u8; req.length as usize],
+            (false, false) => req.data,
+        };
+        let t = RawTransfer {
+            kind,
+            endpoint: req.endpoint,
+            buf,
+            iso_lengths: packets.iter().map(|p| p.length).collect(),
+            transfer_flags: req.transfer_flags,
+        };
+        let (key, mut rx) = match raw.submit(t) {
+            Ok(v) => v,
+            Err(st) => {
+                return Box::pin(async move {
+                    UrbResponse {
+                        status: st,
+                        ..Default::default()
+                    }
+                })
+            }
+        };
+        let raw = raw.clone();
+        Box::pin(async move {
+            let done = tokio::select! {
+                r = &mut rx => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            let c = match done {
+                Some(Ok(c)) => c,
+                Some(Err(_)) => return UrbResponse::error(errno::ESHUTDOWN),
+                None => {
+                    raw.discard(key);
+                    let _ = rx.await;
+                    return UrbResponse::cancelled();
+                }
+            };
+            if kind == URB_TYPE_ISO {
+                let data = if is_in {
+                    compact_iso_in(&c.buf, &packets, &c.iso)
+                } else {
+                    Vec::new()
+                };
+                let actual = if is_in { data.len() as u32 } else { c.actual_length };
+                UrbResponse {
+                    status: c.status,
+                    data,
+                    actual_length: actual,
+                    iso: c.iso,
+                    start_frame: c.start_frame,
+                }
+            } else if is_in {
+                let mut data = c.buf;
+                data.truncate(c.actual_length as usize);
+                UrbResponse {
+                    status: c.status,
+                    actual_length: data.len() as u32,
+                    data,
+                    ..Default::default()
+                }
+            } else {
+                UrbResponse {
+                    status: c.status,
+                    actual_length: c.actual_length,
+                    ..Default::default()
+                }
+            }
+        })
+    }
+
     async fn control(&self, req: &UrbRequest, cancel: &CancellationToken) -> UrbResponse {
         let s = Setup::parse(&req.setup);
+        // Requests addressed to raw-owned interfaces or their endpoints must use the
+        // descriptor that claimed them.
+        if let Some(raw) = self.raw() {
+            let target = (s.index & 0xff) as u8;
+            let raw_iface = s.recipient() == 1 && self.raw_ifaces.lock().unwrap().contains_key(&target);
+            let raw_ep = s.recipient() == 2 && self.raw_owns_endpoint(target);
+            if raw_iface || raw_ep {
+                return self.raw_control(&raw, s, req, cancel).await;
+            }
+        }
         // Requests that change host-side state must go through the usbfs APIs.
         if s.kind() == 0 {
             match (s.recipient(), s.request) {
@@ -325,6 +543,7 @@ impl NusbDevice {
                     }
                     self.drop_endpoints(None);
                     self.interfaces.lock().unwrap().clear();
+                    self.release_raw();
                     if let Err(e) = self.device.set_configuration(s.value as u8).await {
                         warn!("set_configuration: {e}");
                         return UrbResponse::stall();
@@ -408,7 +627,7 @@ impl NusbDevice {
             tokio::select! {
                 r = fut => match r {
                     Ok(data) => UrbResponse::in_data(data),
-                    Err(e) => UrbResponse { status: errno_of(e), data: vec![], actual_length: 0 },
+                    Err(e) => UrbResponse { status: errno_of(e), ..Default::default() },
                 },
                 _ = cancel.cancelled() => UrbResponse::cancelled(),
             }
@@ -427,7 +646,7 @@ impl NusbDevice {
             tokio::select! {
                 r = fut => match r {
                     Ok(()) => UrbResponse::out_ok(req.data.len()),
-                    Err(e) => UrbResponse { status: errno_of(e), data: vec![], actual_length: 0 },
+                    Err(e) => UrbResponse { status: errno_of(e), ..Default::default() },
                 },
                 _ = cancel.cancelled() => UrbResponse::cancelled(),
             }
@@ -441,7 +660,10 @@ impl UsbDevice for NusbDevice {
         if req.is_control() {
             return self.control(&req, cancel).await;
         }
-        if req.iso_packets > 0 {
+        if let (Some(raw), Some(kind)) = (self.raw(), self.raw_endpoint(req.endpoint)) {
+            return self.raw_start(&raw, kind, req, cancel.clone()).await;
+        }
+        if req.is_iso() {
             return UrbResponse::error(errno::EXDEV);
         }
         let ep = match self.endpoint(req.endpoint) {
@@ -475,17 +697,30 @@ impl UsbDevice for NusbDevice {
                 status,
                 actual_length: data.len() as u32,
                 data,
+                ..Default::default()
             }
         } else {
             UrbResponse {
                 status,
                 data: vec![],
                 actual_length: completion.actual_len as u32,
+                ..Default::default()
             }
         }
     }
 
+    fn enqueue(&self, req: UrbRequest, cancel: CancellationToken) -> Result<UrbFuture, UrbRequest> {
+        if req.is_control() {
+            return Err(req);
+        }
+        match (self.raw(), self.raw_endpoint(req.endpoint)) {
+            (Some(raw), Some(kind)) => Ok(self.raw_start(&raw, kind, req, cancel)),
+            _ => Err(req),
+        }
+    }
+
     async fn release(&self) {
+        self.release_raw();
         self.drop_endpoints(None);
         let intfs: Vec<(u8, Interface)> = self.interfaces.lock().unwrap().drain().collect();
         for (n, intf) in intfs {

@@ -4,6 +4,8 @@
 //! [`UsbDevice`]. Devices come from a [`Backend`]: either real hardware
 //! (Linux usbfs via `nusb`) or software-simulated mock devices.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -86,11 +88,30 @@ pub struct UrbRequest {
     pub length: u32,
     /// Linux URB transfer flags (e.g. `URB_ZERO_PACKET`).
     pub transfer_flags: u32,
-    /// Isochronous packet count (0 = not isochronous).
-    pub iso_packets: usize,
+    /// Isochronous packets (empty = not isochronous). For OUT transfers each packet's
+    /// data is `data[offset..offset + length]`.
+    pub iso: Vec<IsoRequest>,
+}
+
+/// One isochronous packet of a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsoRequest {
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// Result of one isochronous packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IsoResult {
+    pub actual_length: u32,
+    /// 0 or a negative Linux errno.
+    pub status: i32,
 }
 
 impl UrbRequest {
+    pub fn is_iso(&self) -> bool {
+        !self.iso.is_empty()
+    }
     pub fn is_in(&self) -> bool {
         self.endpoint & 0x80 != 0
     }
@@ -100,13 +121,19 @@ impl UrbRequest {
 }
 
 /// Result of a transfer. `status` is 0 or a negative Linux errno.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UrbResponse {
     pub status: i32,
-    /// IN data.
+    /// IN data. For isochronous IN transfers this is the received bytes of every
+    /// packet concatenated (each packet's `actual_length` bytes, in order), which is
+    /// how USB/IP sends them.
     pub data: Vec<u8>,
     /// Bytes transferred (for OUT; equals `data.len()` for IN).
     pub actual_length: u32,
+    /// Per-packet results of an isochronous transfer (one per request packet).
+    pub iso: Vec<IsoResult>,
+    /// Frame number the isochronous transfer started in.
+    pub start_frame: i32,
 }
 
 impl UrbResponse {
@@ -116,6 +143,7 @@ impl UrbResponse {
             status: 0,
             data,
             actual_length: n,
+            ..Default::default()
         }
     }
     pub fn out_ok(n: usize) -> Self {
@@ -123,6 +151,7 @@ impl UrbResponse {
             status: 0,
             data: Vec::new(),
             actual_length: n as u32,
+            ..Default::default()
         }
     }
     pub fn error(errno: i32) -> Self {
@@ -130,6 +159,7 @@ impl UrbResponse {
             status: -errno,
             data: Vec::new(),
             actual_length: 0,
+            ..Default::default()
         }
     }
     pub fn stall() -> Self {
@@ -140,12 +170,27 @@ impl UrbResponse {
     }
 }
 
+/// The result of [`UsbDevice::enqueue`].
+pub type UrbFuture = Pin<Box<dyn Future<Output = UrbResponse> + Send + 'static>>;
+
 /// An opened, exclusively claimed USB device.
 #[async_trait]
 pub trait UsbDevice: Send + Sync {
     /// Perform one transfer. Implementations must return promptly once
     /// `cancel` fires (the result is then discarded).
     async fn submit(&self, req: UrbRequest, cancel: &CancellationToken) -> UrbResponse;
+
+    /// Queue a transfer without waiting for earlier ones on the same endpoint.
+    ///
+    /// Devices that can keep several transfers in flight per endpoint (needed for
+    /// isochronous streaming) queue the transfer *before returning*, so the order of
+    /// calls is the order on the wire, and return a future for the result. The
+    /// future must finish promptly once `cancel` fires. Devices that cannot do this
+    /// hand the request back, and the server falls back to [`UsbDevice::submit`],
+    /// one transfer at a time per endpoint.
+    fn enqueue(&self, req: UrbRequest, _cancel: CancellationToken) -> Result<UrbFuture, UrbRequest> {
+        Err(req)
+    }
 
     /// Called when the remote host detaches. Restore kernel drivers etc.
     async fn release(&self) {}

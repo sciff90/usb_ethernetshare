@@ -17,7 +17,7 @@ use usbip_proto::{
     OpRequest, RetSubmit, RetUnlink, UrbMessage,
 };
 
-use crate::device::{Backend, DeviceEntry, UrbRequest, UsbDevice};
+use crate::device::{Backend, DeviceEntry, IsoRequest, IsoResult, UrbRequest, UrbResponse, UsbDevice};
 
 /// Live information about a client using a device.
 #[derive(Debug)]
@@ -349,6 +349,107 @@ pub async fn run_urb_session(
     result
 }
 
+/// Metadata of a CMD_SUBMIT needed to build its RET_SUBMIT.
+struct Submitted {
+    seqnum: u32,
+    direction: Direction,
+    transfer_buffer_length: u32,
+    number_of_packets: u32,
+    iso: Vec<IsoPacket>,
+}
+
+fn into_request(cmd: CmdSubmit) -> (UrbRequest, Submitted) {
+    let ep_addr = (cmd.ep as u8 & 0x0f) | if cmd.direction == Direction::In { 0x80 } else { 0 };
+    let n_iso = iso_count(cmd.number_of_packets);
+    let iso: Vec<IsoRequest> = cmd
+        .iso_packets
+        .iter()
+        .take(n_iso)
+        .map(|p| IsoRequest {
+            offset: p.offset,
+            length: p.length,
+        })
+        .collect();
+    let meta = Submitted {
+        seqnum: cmd.seqnum,
+        direction: cmd.direction,
+        transfer_buffer_length: cmd.transfer_buffer_length,
+        number_of_packets: cmd.number_of_packets,
+        iso: cmd.iso_packets,
+    };
+    let req = UrbRequest {
+        endpoint: ep_addr,
+        setup: cmd.setup,
+        data: cmd.data,
+        length: cmd.transfer_buffer_length,
+        transfer_flags: cmd.transfer_flags,
+        iso,
+    };
+    (req, meta)
+}
+
+/// Send the RET_SUBMIT for a finished transfer, unless it was unlinked meanwhile.
+fn complete(session: &Session, meta: Submitted, resp: UrbResponse) {
+    let mut pending = session.pending.lock().unwrap();
+    if pending.remove(&meta.seqnum).is_none() {
+        return; // unlinked meanwhile; RET_UNLINK already sent
+    }
+    let is_iso = !meta.iso.is_empty();
+    // Every isochronous packet of the request gets a descriptor in the reply.
+    let iso_reply: Vec<IsoPacket> = meta
+        .iso
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let r = resp.iso.get(i).copied().unwrap_or(IsoResult {
+                actual_length: 0,
+                status: if resp.status != 0 {
+                    resp.status
+                } else {
+                    -proto::errno::EXDEV
+                },
+            });
+            IsoPacket {
+                offset: p.offset,
+                length: p.length,
+                actual_length: r.actual_length.min(p.length),
+                status: r.status,
+            }
+        })
+        .collect();
+    let mut data = resp.data;
+    let mut actual = resp.actual_length;
+    if meta.direction == Direction::In {
+        data.truncate(meta.transfer_buffer_length as usize);
+        actual = data.len() as u32;
+        session
+            .usage
+            .bytes_to_client
+            .fetch_add(actual as u64, Ordering::Relaxed);
+    } else {
+        data.clear();
+        if is_iso {
+            actual = iso_reply.iter().map(|p| p.actual_length).sum();
+        }
+        session
+            .usage
+            .bytes_from_client
+            .fetch_add(actual as u64, Ordering::Relaxed);
+    }
+    session.usage.transfers.fetch_add(1, Ordering::Relaxed);
+    let ret = RetSubmit {
+        seqnum: meta.seqnum,
+        status: resp.status,
+        actual_length: actual,
+        start_frame: if is_iso { resp.start_frame } else { 0 },
+        number_of_packets: if is_iso { meta.number_of_packets } else { 0 },
+        error_count: iso_reply.iter().filter(|p| p.status != 0).count() as i32,
+        data,
+        iso_packets: iso_reply,
+    };
+    let _ = session.tx.send(UrbMessage::RetSubmit(ret).encode());
+}
+
 fn spawn_endpoint_worker(device: Arc<dyn UsbDevice>, session: Arc<Session>) -> mpsc::UnboundedSender<Job> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
     tokio::spawn(async move {
@@ -356,62 +457,22 @@ fn spawn_endpoint_worker(device: Arc<dyn UsbDevice>, session: Arc<Session>) -> m
             if token.is_cancelled() {
                 continue;
             }
-            let n_iso = iso_count(cmd.number_of_packets);
-            // Isochronous transfers are not supported yet: report every packet as failed
-            // (the host still needs one descriptor per packet).
-            let iso_reply: Vec<IsoPacket> = cmd
-                .iso_packets
-                .iter()
-                .map(|p| IsoPacket {
-                    offset: p.offset,
-                    length: p.length,
-                    actual_length: 0,
-                    status: -proto::errno::EXDEV,
-                })
-                .collect();
-            let ep_addr = (cmd.ep as u8 & 0x0f) | if cmd.direction == Direction::In { 0x80 } else { 0 };
-            let req = UrbRequest {
-                endpoint: ep_addr,
-                setup: cmd.setup,
-                data: cmd.data,
-                length: cmd.transfer_buffer_length,
-                transfer_flags: cmd.transfer_flags,
-                iso_packets: n_iso,
-            };
-            let resp = device.submit(req, &token).await;
-
-            let mut pending = session.pending.lock().unwrap();
-            if pending.remove(&cmd.seqnum).is_none() {
-                continue; // unlinked meanwhile; RET_UNLINK already sent
+            let (req, meta) = into_request(cmd);
+            match device.enqueue(req, token.clone()) {
+                // Queued on the device in order; wait for it without blocking the next one.
+                Ok(fut) => {
+                    let session = session.clone();
+                    tokio::spawn(async move {
+                        let resp = fut.await;
+                        complete(&session, meta, resp);
+                    });
+                }
+                // One at a time on this endpoint.
+                Err(req) => {
+                    let resp = device.submit(req, &token).await;
+                    complete(&session, meta, resp);
+                }
             }
-            let mut data = resp.data;
-            let mut actual = resp.actual_length;
-            if cmd.direction == Direction::In {
-                data.truncate(cmd.transfer_buffer_length as usize);
-                actual = data.len() as u32;
-                session
-                    .usage
-                    .bytes_to_client
-                    .fetch_add(actual as u64, Ordering::Relaxed);
-            } else {
-                data.clear();
-                session
-                    .usage
-                    .bytes_from_client
-                    .fetch_add(actual as u64, Ordering::Relaxed);
-            }
-            session.usage.transfers.fetch_add(1, Ordering::Relaxed);
-            let ret = RetSubmit {
-                seqnum: cmd.seqnum,
-                status: resp.status,
-                actual_length: actual,
-                start_frame: 0,
-                number_of_packets: if n_iso > 0 { cmd.number_of_packets } else { 0 },
-                error_count: iso_reply.len() as i32,
-                data,
-                iso_packets: iso_reply,
-            };
-            let _ = session.tx.send(UrbMessage::RetSubmit(ret).encode());
         }
     });
     tx

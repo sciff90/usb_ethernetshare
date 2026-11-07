@@ -96,7 +96,7 @@ async fn clear_halt(dev: &dyn UsbDevice, ep: u8) {
         data: vec![],
         length: 0,
         transfer_flags: 0,
-        iso_packets: 0,
+        iso: vec![],
     };
     let _ = transfer(dev, req).await;
 }
@@ -121,7 +121,7 @@ pub async fn bot_command(dev: &dyn UsbDevice, bot: BotInterface, lun: u8, cdb: &
         data: cbw,
         length: 0,
         transfer_flags: 0,
-        iso_packets: 0,
+        iso: vec![],
     };
     if transfer(dev, out).await.is_none() {
         clear_halt(dev, bot.ep_out).await;
@@ -133,7 +133,7 @@ pub async fn bot_command(dev: &dyn UsbDevice, bot: BotInterface, lun: u8, cdb: &
         data: vec![],
         length: 13,
         transfer_flags: 0,
-        iso_packets: 0,
+        iso: vec![],
     };
     let csw = match transfer(dev, csw_req.clone()).await {
         Some(r) => r,

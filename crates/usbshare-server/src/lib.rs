@@ -6,6 +6,8 @@ pub mod server;
 pub mod storage;
 #[cfg(target_os = "linux")]
 pub mod usbfs;
+#[cfg(target_os = "linux")]
+pub mod usbfs_raw;
 pub mod web;
 
 pub use server::Server;

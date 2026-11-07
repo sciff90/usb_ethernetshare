@@ -14,12 +14,15 @@
 #
 #   Dashboard: http://localhost:8080 (either server; run only one of them at a time)
 
+x-usbshare-image: &usbshare-image
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: usbshare:dev
+
 services:
   server:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    image: usbshare:dev
+    <<: *usbshare-image
     command: ["usbshare-server", "--no-usb", "--mock", "loopback,hid,storage:64", "--web"]
     environment:
       RUST_LOG: info
@@ -29,13 +32,13 @@ services:
     networks: [usbnet]
 
   client:
-    image: usbshare:dev
+    <<: *usbshare-image
     depends_on: [server]
     command: ["client-test.sh", "server"]
     networks: [usbnet]
 
   kernel-client:
-    image: usbshare:dev
+    <<: *usbshare-image
     profiles: [kernel]
     depends_on: [server]
     privileged: true
@@ -46,7 +49,7 @@ services:
     networks: [usbnet]
 
   server-usb:
-    image: usbshare:dev
+    <<: *usbshare-image
     profiles: [hardware]
     privileged: true
     volumes:

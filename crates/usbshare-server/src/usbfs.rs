@@ -179,6 +179,16 @@ impl Backend for UsbfsBackend {
             endpoints: Mutex::new(HashMap::new()),
         };
         dev.claim_all().await?;
+        // Undo the "stop/eject" the server's own storage stack may have sent the disk
+        // when its driver was detached; otherwise the remote host sees no medium.
+        let config = dev
+            .device
+            .active_configuration()
+            .ok()
+            .map(|c| c.as_bytes().to_vec());
+        if let Some(config) = config {
+            crate::storage::wake_mass_storage(&dev, busid, &config).await;
+        }
         info!(%busid, "claimed device (kernel drivers detached)");
         Ok(Arc::new(dev))
     }

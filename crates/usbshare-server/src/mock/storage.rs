@@ -24,6 +24,7 @@ const NO_SENSE: (u8, u8, u8) = (0, 0, 0);
 const INVALID_COMMAND: (u8, u8, u8) = (0x05, 0x20, 0x00);
 const INVALID_FIELD: (u8, u8, u8) = (0x05, 0x24, 0x00);
 const LBA_OUT_OF_RANGE: (u8, u8, u8) = (0x05, 0x21, 0x00);
+const MEDIUM_NOT_PRESENT: (u8, u8, u8) = (0x02, 0x3a, 0x00);
 
 #[derive(Debug)]
 enum Phase {
@@ -54,6 +55,9 @@ pub struct StorageDevice {
     spec: DeviceSpec,
     disk: Mutex<Vec<u8>>,
     bot: Mutex<Bot>,
+    /// Medium ejected with START STOP UNIT (LoEj=1, Start=0), like a real stick after
+    /// "safely remove". Media-access commands then fail with MEDIUM NOT PRESENT.
+    ejected: std::sync::atomic::AtomicBool,
 }
 
 impl StorageDevice {
@@ -97,6 +101,7 @@ impl StorageDevice {
                 status: 0,
                 sense: NO_SENSE,
             }),
+            ejected: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -175,8 +180,25 @@ impl StorageDevice {
             return Scsi::Fail(INVALID_COMMAND);
         };
         let blocks = self.blocks();
+        use std::sync::atomic::Ordering::SeqCst;
+        // TEST UNIT READY, READ FORMAT CAPACITIES, READ CAPACITY, READ, WRITE, SYNC, VERIFY.
+        if matches!(
+            op,
+            0x00 | 0x23 | 0x25 | 0x9e | 0x28 | 0x88 | 0x2a | 0x8a | 0x35 | 0x2f
+        ) && self.ejected.load(SeqCst)
+        {
+            return Scsi::Fail(MEDIUM_NOT_PRESENT);
+        }
         match op {
-            0x00 | 0x1e | 0x1b | 0x35 | 0x2f => Scsi::NoData, // TEST UNIT READY, PREVENT ALLOW, START STOP, SYNC CACHE, VERIFY
+            0x1b => {
+                // START STOP UNIT: byte 4 bit 0 = START, bit 1 = LOEJ.
+                let flags = cb.get(4).copied().unwrap_or(0);
+                if flags & 0x02 != 0 {
+                    self.ejected.store(flags & 0x01 == 0, SeqCst);
+                }
+                Scsi::NoData
+            }
+            0x00 | 0x1e | 0x35 | 0x2f => Scsi::NoData, // TEST UNIT READY, PREVENT ALLOW, SYNC CACHE, VERIFY
             0x03 => {
                 // REQUEST SENSE
                 let (key, asc, ascq) = bot.sense;

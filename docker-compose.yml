@@ -23,7 +23,9 @@ services:
     command: ["usbshare-server", "--no-usb", "--mock", "loopback,hid,storage:64", "--web"]
     environment:
       RUST_LOG: info
-    ports: ["8080:8080"]   # web dashboard: http://localhost:8080
+    ports:
+      - "3240:3240"   # USB/IP (clients connect here)
+      - "8080:8080"   # web dashboard: http://localhost:8080
     networks: [usbnet]
 
   client:

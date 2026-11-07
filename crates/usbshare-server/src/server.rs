@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use usbip_proto::{
     self as proto, iso_count, read_op_request, read_urb, CmdSubmit, Direction, ExportedDevice, IsoPacket,
     OpRequest, RetSubmit, RetUnlink, UrbMessage,
@@ -127,9 +127,23 @@ impl Server {
             let (stream, peer) = listener.accept().await?;
             let _ = stream.set_nodelay(true);
             let this = self.clone();
+            // Run each connection in its own task and watch it from a second one, so a
+            // panic is logged instead of silently dropping the connection.
+            let conn = tokio::spawn(async move { this.handle(stream, peer).await });
             tokio::spawn(async move {
-                if let Err(e) = this.handle(stream, peer).await {
-                    debug!(%peer, "connection ended: {e:#}");
+                match conn.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(%peer, "connection error: {e:#}"),
+                    Err(e) if e.is_panic() => {
+                        let msg = e.into_panic();
+                        let msg = msg
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| msg.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".into());
+                        error!(%peer, "connection handler panicked: {msg}");
+                    }
+                    Err(e) => warn!(%peer, "connection task failed: {e}"),
                 }
             });
         }
@@ -192,6 +206,7 @@ impl Server {
             busid: busid.clone(),
         };
 
+        info!(%peer, %busid, backend = backend.name(), "import requested, opening device");
         let device = match backend.open(&busid).await {
             Ok(d) => d,
             Err(e) => {

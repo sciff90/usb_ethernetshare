@@ -169,7 +169,9 @@ impl Backend for UsbfsBackend {
             .into_iter()
             .find(|d| busid_of(d) == busid)
             .ok_or_else(|| anyhow!("device {busid} not found"))?;
+        debug!(%busid, path = %info.sysfs_path().display(), "opening usbfs device");
         let device = info.open().await.with_context(|| format!("opening {busid}"))?;
+        debug!(%busid, "usbfs device opened, claiming interfaces");
         let dev = NusbDevice {
             busid: busid.to_string(),
             device,
@@ -239,6 +241,7 @@ impl NusbDevice {
             Err(_) => Vec::new(), // unconfigured
         };
         for n in numbers {
+            debug!(busid = %self.busid, interface = n, "detaching kernel driver and claiming interface");
             let intf = self
                 .device
                 .detach_and_claim_interface(n)
@@ -465,6 +468,16 @@ impl UsbDevice for NusbDevice {
 #[cfg(test)]
 mod tests {
     use super::Filter;
+
+    /// nusb runs blocking syscalls (open, claim, set configuration) on a thread pool,
+    /// which needs its `tokio` feature. Without it, awaiting them panics. This goes
+    /// through that path without needing USB hardware: opening /dev/null as a device
+    /// must fail with an error, not a panic.
+    #[tokio::test]
+    async fn nusb_blocking_calls_work_under_tokio() {
+        let fd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        assert!(nusb::Device::from_fd(fd).await.is_err());
+    }
 
     #[test]
     fn filter_rules() {

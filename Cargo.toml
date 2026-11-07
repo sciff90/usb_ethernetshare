@@ -20,7 +20,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nusb = "0.2"
+nusb = { version = "0.2", features = ["tokio"] }
 futures-util = "0.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,16 @@
+[package]
+name = "usbip-proto"
+description = "USB/IP wire protocol encoding and decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[features]
+default = ["tokio"]
+
+[dev-dependencies]
+tokio.workspace = true

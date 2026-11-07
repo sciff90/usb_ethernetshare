@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/usbip-proto", "crates/usbshare-server", "crates/usbshare-client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+usbip-proto = { path = "crates/usbip-proto" }
+usbshare-server = { path = "crates/usbshare-server" }
+usbshare-client = { path = "crates/usbshare-client" }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nusb = "0.2"
+futures-util = "0.3"

@@ -1,0 +1,22 @@
+[package]
+name = "usbshare-client"
+description = "Use USB devices shared over the network (USB/IP compatible client)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "usbshare"
+path = "src/main.rs"
+
+[dependencies]
+usbip-proto.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+usbshare-server.workspace = true

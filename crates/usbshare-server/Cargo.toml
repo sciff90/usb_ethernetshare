@@ -1,0 +1,24 @@
+[package]
+name = "usbshare-server"
+description = "Share USB devices over the network (USB/IP compatible server)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "usbshare-server"
+path = "src/main.rs"
+
+[dependencies]
+usbip-proto.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nusb.workspace = true

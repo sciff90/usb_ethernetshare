@@ -1,0 +1,57 @@
+# usbshare test environment.
+#
+#   docker compose up --build --abort-on-container-exit client
+#       User-space test: server with simulated devices, client exercises them over
+#       the network. Works anywhere; needs no USB hardware, kernel modules or privileges.
+#
+#   sudo modprobe vhci-hcd
+#   docker compose --profile kernel up --build --abort-on-container-exit kernel-client
+#       Kernel test: the client attaches the simulated devices through vhci-hcd so they
+#       become real USB devices (lsusb, /dev/sdX, /dev/hidraw) on the host kernel.
+#
+#   docker compose --profile hardware up --build server-usb
+#       Share the host's physical USB devices (see README for gadget-based dummies).
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: usbshare:dev
+    command: ["usbshare-server", "--no-usb", "--mock", "loopback,hid,storage:64"]
+    environment:
+      RUST_LOG: info
+    networks: [usbnet]
+
+  client:
+    image: usbshare:dev
+    depends_on: [server]
+    command: ["client-test.sh", "server"]
+    networks: [usbnet]
+
+  kernel-client:
+    image: usbshare:dev
+    profiles: [kernel]
+    depends_on: [server]
+    privileged: true
+    volumes:
+      - /lib/modules:/lib/modules:ro
+      - /dev:/dev
+    command: ["kernel-test.sh", "server"]
+    networks: [usbnet]
+
+  server-usb:
+    image: usbshare:dev
+    profiles: [hardware]
+    privileged: true
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+      - /run/udev:/run/udev:ro
+    command: ["usbshare-server"]
+    environment:
+      RUST_LOG: info
+    ports: ["3240:3240"]
+    networks: [usbnet]
+
+networks:
+  usbnet: {}
